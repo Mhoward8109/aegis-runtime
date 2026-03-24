@@ -244,32 +244,75 @@ def score_cost_risk(
     """Score cost risk.
 
     Contract 2 §2.3 step 2d:
-    - estimated_cost / budget > 0.8:     -20
-    - flagged for budget overruns:        -30
-
-    Cost estimation at P1 uses agent timeout as a rough proxy.
-    P3 will use actual historical cost data.
+    - cost_time_ratio:  DISABLED — burn-in proved it's uniform noise
+                        (every agent gets -20 with default configs)
+                        Re-enable when real per-agent cost data exists.
+    - flagged for budget overruns: -30 (active, from experience store)
     """
     reasons: list[RoutingReason] = []
 
-    # Rough cost estimate: agent timeout relative to task budget
-    if task.budget.max_duration_seconds > 0:
-        time_ratio = agent.environment.max_execution_seconds / task.budget.max_duration_seconds
-        if time_ratio > 0.8:
-            reasons.append(RoutingReason(
-                factor="cost_time_ratio",
-                delta=-20.0,
-                detail=f"Agent timeout {agent.environment.max_execution_seconds}s "
-                       f"is {time_ratio:.0%} of task budget {task.budget.max_duration_seconds}s",
-            ))
+    # cost_time_ratio: DISABLED per burn-in finding #3.
+    # When all agents share default timeouts, this penalizes everyone
+    # equally and discriminates nothing. Re-enable when agents have
+    # differentiated cost profiles or real cost data is available.
 
-    # Budget overrun flag
+    # Budget overrun flag (still active — discriminates when data exists)
     if experience_store.flagged_for_overruns(agent.agent_id):
         reasons.append(RoutingReason(
             factor="cost_overrun_flag",
             delta=-30.0,
             detail="Agent flagged for budget overruns",
         ))
+
+    return reasons
+
+
+def score_exploration_bonus(
+    task: TaskDescriptor,
+    agent: AgentSpec,
+    experience_store: ExperienceStore,
+    low_history_threshold: int = 3,
+    bonus: float = 10.0,
+) -> list[RoutingReason]:
+    """Mild exploration bonus for low-history agents.
+
+    Burn-in finding: rich-get-richer effect means agents that win early
+    keep winning because they accumulate history faster. This bonus
+    gives underused but eligible agents a small boost to prevent
+    complete starvation.
+
+    Policy: controlled exploration, not pure exploitation.
+    - Agents with < low_history_threshold completions for this task type
+      get a small bonus.
+    - The bonus is intentionally smaller than the historical success rate
+      weight (40) so proven agents still win — but new agents get a chance.
+    """
+    reasons: list[RoutingReason] = []
+
+    task_type = task.required_capabilities[0] if task.required_capabilities else ""
+    success_rate = experience_store.success_rate(agent.agent_id, task_type)
+
+    if success_rate is None:
+        # No history at all — agent has never run this task type
+        reasons.append(RoutingReason(
+            factor="exploration_no_history",
+            delta=bonus,
+            detail=f"No history for {task_type} — exploration bonus",
+        ))
+    else:
+        # Check if history is thin
+        history = getattr(experience_store, 'get_history', lambda x: None)(agent.agent_id)
+        if history:
+            typed_count = sum(
+                1 for r in history.records if r.task_type == task_type
+            )
+            if typed_count < low_history_threshold:
+                reduced_bonus = bonus * 0.5  # Half bonus for thin history
+                reasons.append(RoutingReason(
+                    factor="exploration_low_history",
+                    delta=reduced_bonus,
+                    detail=f"Only {typed_count} runs for {task_type} — exploration bonus",
+                ))
 
     return reasons
 

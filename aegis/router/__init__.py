@@ -20,6 +20,7 @@ from aegis.router.scoring import (
     score_capability_match,
     score_context_relevance,
     score_cost_risk,
+    score_exploration_bonus,
     score_historical_performance,
 )
 from aegis.router.task_descriptor import (

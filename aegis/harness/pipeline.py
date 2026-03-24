@@ -39,6 +39,8 @@ from aegis.registry.trust_registry import TrustRegistry
 from aegis.router.router import RouterConfig, route
 from aegis.router.task_descriptor import TaskBudget, TaskConstraints, TaskDescriptor
 from aegis.router.types import RouteResult, RoutingFailure
+from aegis.state.state_authority import StateAuthority
+from aegis.state import event as evt
 
 from aegis.harness.dispatcher import Dispatcher, DispatcherConfig, ExecutionResult
 
@@ -64,7 +66,8 @@ class PipelineResult:
 class Pipeline:
     """Minimal end-to-end integration harness.
 
-    Owns the registry stack and dispatcher. Provides a single `run()`
+    Owns the registry stack, dispatcher, and state authority.
+    Emits events at each lifecycle stage. Provides a single `run()`
     method that goes from task description to execution result.
     """
 
@@ -73,11 +76,13 @@ class Pipeline:
         dispatcher_config: DispatcherConfig | None = None,
         router_config: RouterConfig | None = None,
         api_client: Any = None,
+        state: StateAuthority | None = None,
     ) -> None:
         self.vocabulary = CapabilityVocabulary()
         self.validator = SchemaValidator(self.vocabulary)
         self.registry = AgentRegistry(self.validator, self.vocabulary)
         self.trust = TrustRegistry()
+        self.state = state or StateAuthority()
         self._router_config = router_config or RouterConfig(
             minimum_confidence_threshold=-1000.0  # Harness is permissive; governor enforces thresholds
         )
@@ -119,19 +124,19 @@ class Pipeline:
     ) -> PipelineResult:
         """Run full pipeline: route → dispatch → result.
 
-        Args:
-            task_id: Unique task identifier.
-            required_capabilities: What the task needs.
-            inputs_available: What data is available.
-            prompt: The actual instruction for the agent.
-            preferred_capabilities: Nice-to-have capabilities for scoring.
-            risk_tier: Task risk level for admission control.
-            routing_mode: How to select candidates.
-            task_context: Optional structured context dict.
-
-        Returns:
-            PipelineResult with output or structured error.
+        Emits events to StateAuthority at each lifecycle stage.
+        Passes agent execution history to router for scoring.
         """
+        # --- Emit task.created ---
+        self.state.record(evt.task_created(
+            task_id=task_id,
+            required_capabilities=required_capabilities,
+            inputs_available=inputs_available,
+            preferred_capabilities=preferred_capabilities,
+            risk_tier=risk_tier.value if isinstance(risk_tier, RiskTier) else str(risk_tier),
+            routing_mode=routing_mode.value if isinstance(routing_mode, RoutingMode) else str(routing_mode),
+        ))
+
         # --- Build task descriptor ---
         try:
             task = TaskDescriptor.create(
@@ -143,6 +148,9 @@ class Pipeline:
                 routing_mode=routing_mode,
             )
         except ValueError as e:
+            self.state.record(evt.task_failed(
+                task_id=task_id, stage_failed="routing", error=str(e),
+            ))
             return PipelineResult(
                 task_id=task_id,
                 success=False,
@@ -150,15 +158,21 @@ class Pipeline:
                 stage_failed="routing",
             )
 
-        # --- Route ---
+        # --- Route (with experience store for scoring) ---
         route_outcome = route(
             task,
             self.registry,
             self.trust,
             config=self._router_config,
+            experience_store=self.state.experience_store,
         )
 
         if isinstance(route_outcome, RoutingFailure):
+            self.state.record(evt.task_failed(
+                task_id=task_id,
+                stage_failed="routing",
+                error=f"{route_outcome.reason.value}: {route_outcome.detail}",
+            ))
             return PipelineResult(
                 task_id=task_id,
                 success=False,
@@ -166,11 +180,32 @@ class Pipeline:
                 stage_failed="routing",
             )
 
+        # --- Emit task.routed ---
+        self.state.record(evt.task_routed(
+            task_id=task_id,
+            primary_agent_id=route_outcome.primary.agent_id,
+            primary_score=route_outcome.primary.score,
+            fallback_agent_ids=[f.agent_id for f in route_outcome.fallbacks],
+            candidates_evaluated=route_outcome.candidates_evaluated,
+            candidates_filtered=route_outcome.candidates_filtered,
+            reasoning=[
+                {"factor": r.factor, "delta": r.delta, "detail": r.detail}
+                for r in route_outcome.primary.reasons
+            ],
+        ))
+
         # Collect scores for observability
         scores = {
             c.agent_id: c.score
             for c in route_outcome.all_candidates
         }
+
+        # --- Emit task.started ---
+        self.state.record(evt.task_started(
+            task_id=task_id,
+            agent_id=route_outcome.primary.agent_id,
+            model=self._dispatcher._config.model,
+        ))
 
         # --- Dispatch ---
         exec_result = self._dispatcher.dispatch(
@@ -180,6 +215,19 @@ class Pipeline:
         )
 
         if exec_result.success:
+            # --- Emit agent.output + task.completed ---
+            self.state.record(evt.agent_output(
+                task_id=task_id,
+                agent_id=exec_result.agent_id,
+                output=exec_result.output,
+            ))
+            self.state.record(evt.task_completed(
+                task_id=task_id,
+                agent_id=exec_result.agent_id,
+                tokens_used=exec_result.tokens_used,
+                duration_seconds=exec_result.duration_seconds,
+                output_length=len(exec_result.output),
+            ))
             return PipelineResult(
                 task_id=task_id,
                 success=True,
@@ -190,6 +238,13 @@ class Pipeline:
                 duration_seconds=exec_result.duration_seconds,
             )
         else:
+            # --- Emit task.failed ---
+            self.state.record(evt.task_failed(
+                task_id=task_id,
+                stage_failed="dispatch",
+                error=exec_result.error,
+                agent_id=exec_result.agent_id,
+            ))
             return PipelineResult(
                 task_id=task_id,
                 success=False,
@@ -209,7 +264,7 @@ class Pipeline:
         preferred_capabilities: list[str] | None = None,
         risk_tier: RiskTier = RiskTier.LOW,
     ) -> RouteResult | RoutingFailure:
-        """Route only — no dispatch. For testing routing decisions."""
+        """Route only — no dispatch, no events. For testing routing decisions."""
         task = TaskDescriptor.create(
             task_id=task_id,
             required_capabilities=required_capabilities,
@@ -217,4 +272,8 @@ class Pipeline:
             preferred_capabilities=preferred_capabilities or [],
             risk_tier=risk_tier,
         )
-        return route(task, self.registry, self.trust, config=self._router_config)
+        return route(
+            task, self.registry, self.trust,
+            config=self._router_config,
+            experience_store=self.state.experience_store,
+        )

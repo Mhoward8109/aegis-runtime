@@ -97,22 +97,55 @@ class TestSpecializationBonus:
 
 class TestCostRisk:
 
-    def test_high_time_ratio_penalized(self):
+    def test_cost_time_ratio_disabled(self):
+        """cost_time_ratio was disabled per burn-in finding #3."""
         task = TaskDescriptor.create("t6", ["build_ui"], ["task_spec"])
-        # Default task budget: 120s. Agent timeout: 300s → ratio = 2.5
         agent = _make_agent(max_execution_seconds=300)
         reasons = score_cost_risk(task, agent, NullExperienceStore())
         cost = [r for r in reasons if r.factor == "cost_time_ratio"]
-        assert len(cost) == 1
-        assert cost[0].delta == -20.0
+        assert len(cost) == 0  # Disabled — no longer applied
 
-    def test_low_time_ratio_no_penalty(self):
+    def test_overrun_flag_still_active(self):
+        class FlaggedStore(NullExperienceStore):
+            def flagged_for_overruns(self, agent_id):
+                return True
+
         task = TaskDescriptor.create("t7", ["build_ui"], ["task_spec"])
-        # Agent timeout: 60s, budget: 120s → ratio = 0.5
-        agent = _make_agent(max_execution_seconds=60)
-        reasons = score_cost_risk(task, agent, NullExperienceStore())
-        cost = [r for r in reasons if r.factor == "cost_time_ratio"]
-        assert len(cost) == 0
+        agent = _make_agent()
+        reasons = score_cost_risk(task, agent, FlaggedStore())
+        overrun = [r for r in reasons if r.factor == "cost_overrun_flag"]
+        assert len(overrun) == 1
+        assert overrun[0].delta == -30.0
+
+
+class TestExplorationBonus:
+
+    def test_no_history_gets_bonus(self):
+        from aegis.router.scoring import score_exploration_bonus
+        task = TaskDescriptor.create("t20", ["build_ui"], ["task_spec"])
+        agent = _make_agent()
+        reasons = score_exploration_bonus(task, agent, NullExperienceStore())
+        explore = [r for r in reasons if r.factor == "exploration_no_history"]
+        assert len(explore) == 1
+        assert explore[0].delta == 10.0
+
+    def test_established_agent_no_bonus(self):
+        """Agent with enough history gets no exploration bonus."""
+        from aegis.router.scoring import score_exploration_bonus
+
+        class EstablishedStore(NullExperienceStore):
+            def success_rate(self, agent_id, task_type):
+                return 0.9
+            def get_history(self, agent_id):
+                from aegis.state.agent_history_projection import AgentHistory, AgentRecord
+                h = AgentHistory(agent_id=agent_id)
+                h.records = [AgentRecord(f"t{i}", True, task_type="build_ui") for i in range(5)]
+                return h
+
+        task = TaskDescriptor.create("t21", ["build_ui"], ["task_spec"])
+        agent = _make_agent()
+        reasons = score_exploration_bonus(task, agent, EstablishedStore())
+        assert len(reasons) == 0  # No bonus for established agents
 
 
 class TestStubBehavior:
