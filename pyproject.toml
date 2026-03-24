@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "aegis"
+version = "0.1.0"
+description = "Aegis Runtime — Agent Operating System infrastructure"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+# No runtime dependencies beyond stdlib.
+# The entire P0 package runs on Python 3.12+ with zero external deps.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["aegis/tests"]
